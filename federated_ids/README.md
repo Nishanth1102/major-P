@@ -1,11 +1,13 @@
 # Federated Intrusion Detection with Flower + PyTorch
 
 A research-ready Federated Learning (FL) simulation for binary network intrusion detection (Benign vs. Attack) using:
-- **Dataset**: [CIC-IDS 2018](https://www.unb.ca/cic/datasets/ids-2018.html) (Canadian Institute for Cybersecurity)
 - **FL Framework**: [Flower (flwr) 1.8.0](https://flower.dev)
 - **ML Framework**: PyTorch 2.2+
 - **OS**: Windows (Python 3.12 virtual environment)
 
+## Dataset
+You can download it from Kaggle:
+https://www.kaggle.com/datasets/solarmainframe/ids-intrusion-csv/data
 ---
 
 ## Project Structure
