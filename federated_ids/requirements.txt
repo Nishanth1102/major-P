@@ -1,0 +1,17 @@
+# =====================================================================
+# Federated Learning – CIC-IDS 2018 Intrusion Detection
+# requirements.txt
+# Compatible with Python 3.12 on Windows
+# =====================================================================
+
+# Flower Federated Learning framework
+flwr==1.8.0
+
+# Deep learning
+torch>=2.2.0              # CPU build is fine for simulation; install CUDA build for GPU
+torchvision>=0.17.0       # Optional but avoids import warnings
+
+# Data science stack
+scikit-learn>=1.4.0
+pandas>=2.2.0
+numpy>=1.26.0

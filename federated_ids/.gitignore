@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+env/
+.env
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data (usually too large and not versioned)
+data/
+
+# Results, logs, and saved models
+results/
+*.pt
+*.pth
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
