@@ -26,6 +26,10 @@ from typing import Dict, List, Tuple
 from model import MLP, get_parameters, set_parameters, train, evaluate
 from data_utils import get_client_data
 
+# ---- Gradient Compression (new) ----
+# Import compression helpers from the companion module
+from compression_utils import top_k_sparsify, quantize_fp16, compression_stats
+
 # Suppress non-critical warnings for cleaner output
 warnings.filterwarnings("ignore")
 
@@ -40,6 +44,18 @@ BATCH_SIZE    = 256
 LOCAL_EPOCHS  = 3                  # Epochs per FL round (keep low for simulation)
 LEARNING_RATE = 1e-3
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------------------------
+# Compression Configuration
+# ---------------------------------------------------------------------------
+# Toggle compression on/off for easy A/B comparison:
+#   True  → apply Top-K sparsification + FP16 quantization before sending
+#   False → send raw float32 weights (original baseline behaviour)
+USE_COMPRESSION = True
+
+# Fraction of gradient values to KEEP (by absolute magnitude).
+# 0.10 = keep top 10%, zero out the remaining 90%.
+TOP_K_RATIO = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +150,13 @@ class IDSClient(fl.client.NumPyClient):
 
         Parameters: global model weights from server.
         Returns:    (updated_weights, num_train_samples, metrics_dict)
+
+        If USE_COMPRESSION is True:
+          1. Top-K sparsification  — zero out the lowest 90% gradient values
+          2. FP16 quantization      — round precision to float16 resolution
+          3. Compression stats      — print KB saved and % reduction
+        The return type is always List[np.ndarray] (float32) so Flower is
+        never aware of the compression happening on the client side.
         """
         round_num = config.get("server_round", "?")
         print(f"\n[Client {self.client_id}] === Round {round_num} — FIT ===")
@@ -153,7 +176,27 @@ class IDSClient(fl.client.NumPyClient):
         num_samples = sum(len(batch[0]) for batch in self.train_loader)
         print(f"[Client {self.client_id}] Train loss: {avg_loss:.4f}  Samples: {num_samples}")
 
-        return get_parameters(self.model), num_samples, {"train_loss": float(avg_loss)}
+        # --- Gradient Compression Pipeline (new) ---
+        # Retrieve current (post-training) model weights
+        updated_params = get_parameters(self.model)
+
+        if USE_COMPRESSION:
+            # Step 1: Top-K sparsification — keep only top TOP_K_RATIO values
+            sparse_params = top_k_sparsify(updated_params, k_ratio=TOP_K_RATIO)
+
+            # Step 2: FP16 quantization — fp32 → fp16 → fp32 round-trip
+            #         Flower always receives float32; we just reduce precision.
+            quant_params  = quantize_fp16(sparse_params)
+
+            # Step 3: Log the communication cost savings for this round
+            print(f"[Client {self.client_id}] Compression active (Top-K={TOP_K_RATIO}, FP16):")
+            compression_stats(updated_params, quant_params)
+
+            # Return compressed updates — Flower sees normal List[np.ndarray]
+            return quant_params, num_samples, {"train_loss": float(avg_loss)}
+
+        # USE_COMPRESSION = False → original baseline, no changes to weights
+        return updated_params, num_samples, {"train_loss": float(avg_loss)}
 
     # ------------------------------------------------------------------
     # Flower interface: evaluate
