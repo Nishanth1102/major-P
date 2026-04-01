@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore")
 DATA_DIR      = "./data/raw"       # Folder containing CIC-IDS 2018 CSVs
 SERVER_ADDR   = "127.0.0.1:8080"  # Must match server.py
 BATCH_SIZE    = 256
-LOCAL_EPOCHS  = 3                  # Epochs per FL round (keep low for simulation)
+LOCAL_EPOCHS  = 1                  # Epochs per FL round (keep low for simulation)
 LEARNING_RATE = 1e-3
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -51,11 +51,12 @@ DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Toggle compression on/off for easy A/B comparison:
 #   True  → apply Top-K sparsification + FP16 quantization before sending
 #   False → send raw float32 weights (original baseline behaviour)
-USE_COMPRESSION = True
+import os
+USE_COMPRESSION = os.getenv("USE_COMPRESSION", "True") == "True"
 
 # Fraction of gradient values to KEEP (by absolute magnitude).
 # 0.10 = keep top 10%, zero out the remaining 90%.
-TOP_K_RATIO = 0.10
+TOP_K_RATIO = float(os.getenv("TOP_K_RATIO", "0.10"))
 
 
 # ---------------------------------------------------------------------------

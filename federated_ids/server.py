@@ -25,7 +25,7 @@ from typing import List, Tuple, Optional, Dict
 # ---------------------------------------------------------------------------
 
 SERVER_ADDR       = "0.0.0.0:8080"    # Listen on all interfaces
-NUM_ROUNDS        = 10                 # Total FL rounds
+NUM_ROUNDS        = 5                 # Total FL rounds
 NUM_CLIENTS       = 2                  # Expected number of clients
 
 # Minimum clients needed to start a round
