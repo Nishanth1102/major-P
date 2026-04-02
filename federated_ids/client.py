@@ -28,7 +28,7 @@ from data_utils import get_client_data
 
 # ---- Gradient Compression (new) ----
 # Import compression helpers from the companion module
-from compression_utils import top_k_sparsify, quantize_fp16, compression_stats
+from compression_utils import encode_sparse, compression_stats
 
 # Suppress non-critical warnings for cleaner output
 warnings.filterwarnings("ignore")
@@ -80,6 +80,7 @@ class IDSClient(fl.client.NumPyClient):
 
         self.client_id   = client_id
         self.num_clients = num_clients
+        self.error       = None
 
         # -------------------------------------------------------------------
         # Load this client's Non-IID data partition
@@ -164,6 +165,7 @@ class IDSClient(fl.client.NumPyClient):
 
         # Load aggregated global weights
         self._set_parameters(parameters)
+        old_weights = [np.copy(p) for p in parameters]
 
         # Local training
         avg_loss = train(
@@ -177,27 +179,34 @@ class IDSClient(fl.client.NumPyClient):
         num_samples = sum(len(batch[0]) for batch in self.train_loader)
         print(f"[Client {self.client_id}] Train loss: {avg_loss:.4f}  Samples: {num_samples}")
 
-        # --- Gradient Compression Pipeline (new) ---
-        # Retrieve current (post-training) model weights
-        updated_params = get_parameters(self.model)
+        # --- Gradient Compression Pipeline with EF-SGD ---
+        new_weights = get_parameters(self.model)
 
         if USE_COMPRESSION:
-            # Step 1: Top-K sparsification — keep only top TOP_K_RATIO values
-            sparse_params = top_k_sparsify(updated_params, k_ratio=TOP_K_RATIO)
+            # 1. Compute delta (gradient update)
+            delta = [nw - ow for nw, ow in zip(new_weights, old_weights)]
+            
+            # 2. Init error if needed (first round)
+            if self.error is None:
+                self.error = [np.zeros_like(d) for d in delta]
+                
+            # 3. Accumulate error + delta
+            accumulator = [d + e for d, e in zip(delta, self.error)]
+            
+            # 4. Encode and sparsify
+            sparse_payload, compressed_delta_dense = encode_sparse(accumulator, k_ratio=TOP_K_RATIO)
+            
+            # 5. Update residual error
+            self.error = [acc - comp for acc, comp in zip(accumulator, compressed_delta_dense)]
+            
+            print(f"[Client {self.client_id}] Compression active (Top-K={TOP_K_RATIO}, EF-SGD):")
+            compression_stats(accumulator, sparse_payload)
 
-            # Step 2: FP16 quantization — fp32 → fp16 → fp32 round-trip
-            #         Flower always receives float32; we just reduce precision.
-            quant_params  = quantize_fp16(sparse_params)
+            # Return sparse encoded payload
+            return sparse_payload, num_samples, {"train_loss": float(avg_loss)}
 
-            # Step 3: Log the communication cost savings for this round
-            print(f"[Client {self.client_id}] Compression active (Top-K={TOP_K_RATIO}, FP16):")
-            compression_stats(updated_params, quant_params)
-
-            # Return compressed updates — Flower sees normal List[np.ndarray]
-            return quant_params, num_samples, {"train_loss": float(avg_loss)}
-
-        # USE_COMPRESSION = False → original baseline, no changes to weights
-        return updated_params, num_samples, {"train_loss": float(avg_loss)}
+        # Baseline: No compression, return standard dense weights
+        return new_weights, num_samples, {"train_loss": float(avg_loss)}
 
     # ------------------------------------------------------------------
     # Flower interface: evaluate

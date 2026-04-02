@@ -2,153 +2,103 @@
 compression_utils.py
 --------------------
 Reusable gradient compression helpers for Federated Learning.
-
-Functions
----------
-top_k_sparsify(params, k_ratio)
-    Keep only the top k% highest-magnitude values in each parameter array;
-    zero out the rest (Top-K sparsification).
-
-quantize_fp16(params)
-    Simulate FP16 quantization by casting float32 → float16 → float32.
-    This quantizes the precision while keeping the dtype as float32 so that
-    Flower's gRPC serializer remains fully compatible.
-
-compression_stats(original, compressed)
-    Print and return the byte-size reduction achieved after compression.
-
-Usage example
--------------
-    from compression_utils import top_k_sparsify, quantize_fp16, compression_stats
-
-    updated = get_parameters(model)           # List[np.ndarray] float32
-    sparse  = top_k_sparsify(updated, 0.10)  # Keep top 10%
-    quant   = quantize_fp16(sparse)           # Quantize precision
-    compression_stats(updated, quant)         # Log savings
 """
 
 import numpy as np
-from typing import List
+from typing import List, Tuple
 
-
-# ---------------------------------------------------------------------------
-# 1. Top-K Sparsification
-# ---------------------------------------------------------------------------
-
-def top_k_sparsify(
-    params: List[np.ndarray],
+def encode_sparse(
+    params_delta: List[np.ndarray],
     k_ratio: float = 0.10,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """
-    Apply Top-K sparsification to a list of parameter arrays.
-
-    For each array, only the top `k_ratio` fraction of values (by absolute
-    magnitude) are kept; all other values are set to zero. This reduces the
-    number of non-zero values that need to be transmitted.
-
-    Parameters
-    ----------
-    params  : List of NumPy arrays (model weights / gradients), float32.
-    k_ratio : Fraction of values to KEEP (0 < k_ratio <= 1.0).
-              Default 0.10 keeps the top 10% — discards 90%.
-
-    Returns
-    -------
-    List[np.ndarray]  Same shapes as input, dtype float32.
+    Apply Top-K sparsification and FP16 quantization to a list of delta arrays.
+    Returns the sparse payload for transmission and the effective dense delta
+    used for local error tracking.
     """
     if not (0.0 < k_ratio <= 1.0):
         raise ValueError(f"k_ratio must be in (0, 1]. Got {k_ratio}")
 
-    sparsified = []
-    for layer in params:
-        flat = layer.flatten()                      # Work on a 1-D view
-        k    = max(1, int(len(flat) * k_ratio))     # At least 1 value kept
+    sparse_payload = []
+    dense_deltas = []
+
+    for layer in params_delta:
+        shape_arr = np.array(layer.shape, dtype=np.int32)
+        flat = layer.flatten()
+        k = max(1, int(len(flat) * k_ratio))
 
         # Find the k-th largest absolute value as the threshold
-        threshold = np.partition(np.abs(flat), -k)[-k]
+        if k < len(flat):
+            threshold = np.partition(np.abs(flat), -k)[-k]
+        else:
+            threshold = 0.0
 
-        # Zero out everything below the threshold
-        mask         = np.abs(layer) >= threshold
-        sparse_layer = (layer * mask).astype(np.float32)
-        sparsified.append(sparse_layer)
+        # Extract top-K indices and values
+        indices = np.where(np.abs(flat) >= threshold)[0].astype(np.int32)
+        
+        # simulated fp16 precision
+        values = flat[indices].astype(np.float16).astype(np.float32)
 
-    return sparsified
+        sparse_payload.extend([shape_arr, indices, values])
+
+        # Reconstruct the effective dense layer for error tracking
+        dense_layer_flat = np.zeros_like(flat)
+        dense_layer_flat[indices] = values
+        dense_deltas.append(dense_layer_flat.reshape(layer.shape))
+
+    return sparse_payload, dense_deltas
 
 
-# ---------------------------------------------------------------------------
-# 2. FP16 Quantization
-# ---------------------------------------------------------------------------
-
-def quantize_fp16(
-    params: List[np.ndarray],
+def decode_sparse(
+    sparse_payload: List[np.ndarray]
 ) -> List[np.ndarray]:
     """
-    Simulate FP16 quantization on a list of parameter arrays.
-
-    Casts each float32 array → float16 → float32.
-    The round-trip clips precision to FP16 resolution (~3 decimal digits)
-    while keeping the final dtype as float32, which is required by Flower.
-
-    Parameters
-    ----------
-    params : List of NumPy arrays, dtype float32.
-
-    Returns
-    -------
-    List[np.ndarray]  Same shapes, dtype float32 (FP16-precision values).
+    Reconstructs the dense delta list from the sparse network payload.
     """
-    return [layer.astype(np.float16).astype(np.float32) for layer in params]
+    reconstructed_deltas = []
+    for i in range(0, len(sparse_payload), 3):
+        shape = tuple(sparse_payload[i])
+        indices = sparse_payload[i+1].astype(int)
+        values = sparse_payload[i+2]
+        
+        dense_flat = np.zeros(np.prod(shape), dtype=np.float32)
+        dense_flat[indices] = values
+        reconstructed_deltas.append(dense_flat.reshape(shape))
+        
+    return reconstructed_deltas
 
-
-# ---------------------------------------------------------------------------
-# 3. Communication Cost Logger
-# ---------------------------------------------------------------------------
 
 def compression_stats(
-    original: List[np.ndarray],
-    compressed: List[np.ndarray],
+    original_deltas: List[np.ndarray],
+    sparse_payload: List[np.ndarray],
 ) -> float:
     """
     Compute and print the byte-size reduction due to compression.
-
-    Compares the raw float32 byte footprint of `original` against `compressed`.
-    Note: both inputs are float32 arrays; the savings measured here represent
-    the *effective* reduction from sparsification (90% zeros compress well in
-    practice) and the precision reduction from FP16 quantization.
-
-    Parameters
-    ----------
-    original   : Original parameter list (float32).
-    compressed : Compressed parameter list (float32, sparsified + quantized).
-
-    Returns
-    -------
-    float  Percentage reduction in bytes (0–100).
     """
-    # Total bytes if transmitted as float32
-    orig_bytes = sum(arr.nbytes for arr in original)
+    # Total bytes if transmitted as dense float32
+    orig_bytes = sum(arr.nbytes for arr in original_deltas)
 
     # Effective bytes after compression:
-    # - Sparsified arrays: non-zero values only need ~4 bytes each (float32)
-    # - Quantized arrays: precision is FP16, so effective cost is ~2 bytes each
-    # We approximate: count non-zero elements × 2 bytes (FP16 effective size)
-    comp_bytes = sum(
-        int(np.count_nonzero(arr)) * 2   # 2 bytes per non-zero (FP16)
-        for arr in compressed
-    )
-    comp_bytes = max(comp_bytes, 1)  # Avoid division by zero edge case
+    # shape array + indices array (int32 = 4 bytes) + values array (fp16 effective = 2 bytes)
+    comp_bytes = 0
+    for i in range(0, len(sparse_payload), 3):
+        comp_bytes += sparse_payload[i].nbytes       # shape
+        comp_bytes += sparse_payload[i+1].nbytes     # indices (int32 default)
+        # We count values as 2 bytes conceptually since it represents fp16 data
+        comp_bytes += len(sparse_payload[i+2]) * 2
+        
+    comp_bytes = max(comp_bytes, 1)
 
     reduction_pct = (1.0 - comp_bytes / orig_bytes) * 100.0
 
     print(
-        f"\n  [Compression] Original : {orig_bytes / 1024:.2f} KB (float32)"
+        f"\n  [Compression] Original (Dense)  : {orig_bytes / 1024:.2f} KB"
     )
     print(
-        f"  [Compression] Compressed: {comp_bytes / 1024:.2f} KB "
-        f"(Top-K sparse + FP16 effective)"
+        f"  [Compression] Compressed Payload: {comp_bytes / 1024:.2f} KB"
     )
     print(
-        f"  [Compression] Reduction : {reduction_pct:.1f}%"
+        f"  [Compression] Reduction         : {reduction_pct:.1f}%"
     )
 
     return reduction_pct

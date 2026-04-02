@@ -18,6 +18,7 @@ import csv
 import flwr as fl
 from flwr.common import Metrics
 from typing import List, Tuple, Optional, Dict
+from compression_utils import decode_sparse
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ NUM_CLIENTS       = 2                  # Expected number of clients
 MIN_FIT_CLIENTS   = NUM_CLIENTS        # All clients must participate in training
 MIN_EVAL_CLIENTS  = NUM_CLIENTS        # All clients must evaluate
 MIN_AVAIL_CLIENTS = NUM_CLIENTS        # All clients must be available
+
 
 # Results directory
 RESULTS_DIR       = "./results"
@@ -159,15 +161,64 @@ class RoundLogger:
 
 
 # ---------------------------------------------------------------------------
-# Build Strategy
+# Build Strategy Config & Custom Sparse Strategy
 # ---------------------------------------------------------------------------
+
+class SparseEFStrategy(fl.server.strategy.FedAvg):
+    """
+    Custom strategy to handle Sparse Payload decoding for EF-SGD and FedAvg.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_global_weights = None
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        # Save a copy of the current global weights for delta reconstruction
+        if parameters is not None:
+            self.current_global_weights = fl.common.parameters_to_ndarrays(parameters)
+        return super().configure_fit(server_round, parameters, client_manager)
+
+    def aggregate_fit(self, server_round, results, failures):
+        if not results:
+            return super().aggregate_fit(server_round, results, failures)
+        
+        dense_results = []
+        for client_proxy, fit_res in results:
+            sparse_payload = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            
+            # Check if it uses the sparse payload format (length == 3 * num_layers)
+            # Normal weights length for this MLP is 8.
+            # Using self.current_global_weights (which is not None here) to verify baseline size.
+            if self.current_global_weights and len(sparse_payload) > len(self.current_global_weights) and len(sparse_payload) % 3 == 0:
+                reconstructed_delta = decode_sparse(sparse_payload)
+                # Reconstruct full client weights: old_global + delta
+                client_weights = [g + d for g, d in zip(self.current_global_weights, reconstructed_delta)]
+            else:
+                # Fallback to standard dense weight updates if compression is off
+                client_weights = sparse_payload
+                
+            dense_results.append((client_weights, fit_res.num_examples))
+        
+        # Standard weighted average of the dense weights
+        from flwr.server.strategy.aggregate import aggregate
+        aggregated_weights = aggregate(dense_results)
+        parameters_aggregated = fl.common.ndarrays_to_parameters(aggregated_weights)
+        
+        # Aggregate metrics
+        metrics_aggregated = {}
+        if self.fit_metrics_aggregation_fn:
+            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+            
+        return parameters_aggregated, metrics_aggregated
+
 
 def build_strategy() -> fl.server.strategy.Strategy:
     """
-    Configure FedAvg strategy with metric aggregation functions.
+    Configure Custom Sparse FedAvg Strategy.
     Wrap it with RoundLogger to save metrics to CSV.
     """
-    fedavg = fl.server.strategy.FedAvg(
+    sparse_fedavg = SparseEFStrategy(
         # Minimum clients to start a round
         min_fit_clients           = MIN_FIT_CLIENTS,
         min_evaluate_clients      = MIN_EVAL_CLIENTS,
@@ -182,7 +233,7 @@ def build_strategy() -> fl.server.strategy.Strategy:
         evaluate_metrics_aggregation_fn = weighted_average_accuracy,
     )
 
-    return RoundLogger(fedavg)
+    return RoundLogger(sparse_fedavg)
 
 
 # ---------------------------------------------------------------------------
