@@ -18,6 +18,7 @@ import csv
 import flwr as fl
 from flwr.common import Metrics
 from typing import List, Tuple, Optional, Dict
+from compression_utils import decode_sparse
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +26,7 @@ from typing import List, Tuple, Optional, Dict
 # ---------------------------------------------------------------------------
 
 SERVER_ADDR       = "0.0.0.0:8080"    # Listen on all interfaces
-NUM_ROUNDS        = 5                 # Total FL rounds
+NUM_ROUNDS        = 2                 # Total FL rounds
 NUM_CLIENTS       = 2                  # Expected number of clients
 
 # Minimum clients needed to start a round
@@ -92,6 +93,7 @@ class RoundLogger:
     def __init__(self, base_strategy: fl.server.strategy.Strategy) -> None:
         self.strategy = base_strategy
         self._round   = 0
+        self.last_train_loss = 0.0
 
         # Create results directory and CSV with header
         os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -110,7 +112,36 @@ class RoundLogger:
         print(f"\n{'=' * 50}")
         print(f" Round {server_round} / {NUM_ROUNDS} — Aggregating FIT")
         print(f"{'=' * 50}")
-        return self.strategy.aggregate_fit(server_round, results, failures)
+        output = self.strategy.aggregate_fit(server_round, results, failures)
+        
+        if output is not None:
+            parameters_aggregated, metrics_aggregated = output
+            self.last_train_loss = metrics_aggregated.get("train_loss", 0.0)
+            
+            # Save the PyTorch model once training finishes
+            if server_round == NUM_ROUNDS:
+                os.makedirs("models", exist_ok=True)
+                try:
+                    from client import LOCAL_EPOCHS
+                    from model import MLP, set_parameters
+                    import torch
+                    
+                    ndarrays = fl.common.parameters_to_ndarrays(parameters_aggregated)
+                    input_dim = ndarrays[0].shape[1]
+                    
+                    global_model = MLP(input_dim=input_dim)
+                    set_parameters(global_model, ndarrays)
+                    
+                    is_compressed = os.getenv("USE_COMPRESSION", "False") == "True"
+                    model_type = "compressed" if is_compressed else "baseline"
+                    
+                    save_path = f"models/MLP-{model_type}-{NUM_ROUNDS}rounds-{LOCAL_EPOCHS}epochs.pth"
+                    torch.save(global_model.state_dict(), save_path)
+                    print(f"\n  [Server] Final Global Aggregated Model successfully saved to: {save_path}")
+                except Exception as e:
+                    print(f"\n  [Server] Warning: Failed to save final model: {e}")
+
+        return output
 
     def aggregate_evaluate(self, server_round, results, failures):
         """Called after clients finish evaluation; logs accuracy to CSV."""
@@ -121,7 +152,9 @@ class RoundLogger:
         if output is not None:
             loss_agg, metrics_agg = output
             accuracy = metrics_agg.get("accuracy", 0.0) if metrics_agg else 0.0
-            train_loss = 0.0  # placeholder (fit metrics not easily accessible here)
+            
+            # Fetch the actual training loss we tracked dynamically during aggregate_fit
+            train_loss = getattr(self, "last_train_loss", 0.0)
 
             # Append row to CSV
             with open(METRICS_FILE, "a", newline="") as f:
@@ -159,15 +192,64 @@ class RoundLogger:
 
 
 # ---------------------------------------------------------------------------
-# Build Strategy
+# Build Strategy Config & Custom Sparse Strategy
 # ---------------------------------------------------------------------------
+
+class SparseEFStrategy(fl.server.strategy.FedAvg):
+    """
+    Custom strategy to handle Sparse Payload decoding for EF-SGD and FedAvg.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_global_weights = None
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        # Save a copy of the current global weights for delta reconstruction
+        if parameters is not None:
+            self.current_global_weights = fl.common.parameters_to_ndarrays(parameters)
+        return super().configure_fit(server_round, parameters, client_manager)
+
+    def aggregate_fit(self, server_round, results, failures):
+        if not results:
+            return super().aggregate_fit(server_round, results, failures)
+        
+        dense_results = []
+        for client_proxy, fit_res in results:
+            sparse_payload = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            
+            # Check if it uses the sparse payload format (length == 3 * num_layers)
+            # Normal weights length for this MLP is 8.
+            # Using self.current_global_weights (which is not None here) to verify baseline size.
+            if self.current_global_weights and len(sparse_payload) > len(self.current_global_weights) and len(sparse_payload) % 3 == 0:
+                reconstructed_delta = decode_sparse(sparse_payload)
+                # Reconstruct full client weights: old_global + delta
+                client_weights = [g + d for g, d in zip(self.current_global_weights, reconstructed_delta)]
+            else:
+                # Fallback to standard dense weight updates if compression is off
+                client_weights = sparse_payload
+                
+            dense_results.append((client_weights, fit_res.num_examples))
+        
+        # Standard weighted average of the dense weights
+        from flwr.server.strategy.aggregate import aggregate
+        aggregated_weights = aggregate(dense_results)
+        parameters_aggregated = fl.common.ndarrays_to_parameters(aggregated_weights)
+        
+        # Aggregate metrics
+        metrics_aggregated = {}
+        if self.fit_metrics_aggregation_fn:
+            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+            
+        return parameters_aggregated, metrics_aggregated
+
 
 def build_strategy() -> fl.server.strategy.Strategy:
     """
-    Configure FedAvg strategy with metric aggregation functions.
+    Configure Custom Sparse FedAvg Strategy.
     Wrap it with RoundLogger to save metrics to CSV.
     """
-    fedavg = fl.server.strategy.FedAvg(
+    sparse_fedavg = SparseEFStrategy(
         # Minimum clients to start a round
         min_fit_clients           = MIN_FIT_CLIENTS,
         min_evaluate_clients      = MIN_EVAL_CLIENTS,
@@ -182,7 +264,7 @@ def build_strategy() -> fl.server.strategy.Strategy:
         evaluate_metrics_aggregation_fn = weighted_average_accuracy,
     )
 
-    return RoundLogger(fedavg)
+    return RoundLogger(sparse_fedavg)
 
 
 # ---------------------------------------------------------------------------
