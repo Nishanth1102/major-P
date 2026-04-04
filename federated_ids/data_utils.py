@@ -105,6 +105,10 @@ def preprocess(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     cols_to_drop = [c for c in _COLS_TO_DROP if c in df.columns]
     df = df.drop(columns=cols_to_drop)
 
+    # --- Cast to numeric, coercing any string artifacts (like repeated headers) to NaN ---
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
     # --- Keep only numeric columns ---
     df = df.select_dtypes(include=[np.number])
 
